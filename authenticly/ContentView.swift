@@ -33,6 +33,10 @@ struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \JournalEntry.timestamp, order: .reverse) private var entries: [JournalEntry]
     
+    // API Integration
+    @StateObject private var apiClient = APIClient.shared
+    @StateObject private var syncService = SyncService.shared
+    
     @State private var currentEntry: JournalEntry?
     @State private var text: String = ""
     @State private var selectedFont: String = "Lato-Regular"
@@ -42,6 +46,9 @@ struct ContentView: View {
     @State private var showingHistory = false
     @State private var showingSettings = false
     @State private var showingChatMenu = false
+    @State private var showingAIAnalysis = false
+    @State private var aiAnalysisText = ""
+    @State private var isAnalyzing = false
     @AppStorage("colorScheme") private var colorScheme: ColorScheme = .light
     @State private var placeholderText: String = ""
     @State private var didCopyPrompt: Bool = false
@@ -93,6 +100,10 @@ struct ContentView: View {
             .navigationBarHidden(true)
             .onAppear {
                 setupInitialState()
+                syncService.configure(with: modelContext)
+                Task {
+                    await syncService.performFullSync()
+                }
             }
             .onReceive(timer) { _ in
                 if timerIsRunning && timeRemaining > 0 {
@@ -120,6 +131,9 @@ struct ContentView: View {
                 .preferredColorScheme(colorScheme)
             }
             .confirmationDialog("Chat with AI", isPresented: $showingChatMenu, titleVisibility: .visible) {
+                Button("AI Analysis") {
+                    analyzeWithGemini()
+                }
                 Button("ChatGPT") {
                     openChatGPT()
                 }
@@ -132,6 +146,13 @@ struct ContentView: View {
                 Button("Cancel", role: .cancel) { }
             } message: {
                 Text("Choose your AI assistant")
+            }
+            .sheet(isPresented: $showingAIAnalysis) {
+                AIAnalysisView(
+                    analysisText: aiAnalysisText,
+                    isAnalyzing: isAnalyzing,
+                    onDismiss: { showingAIAnalysis = false }
+                )
             }
         }
         .preferredColorScheme(colorScheme)
@@ -314,7 +335,13 @@ struct ContentView: View {
         guard let entry = currentEntry else { return }
         entry.content = text
         entry.updatePreviewText()
+        entry.markForSync()
         try? modelContext.save()
+        
+        // Sync to backend if connected
+        Task {
+            await syncService.syncSingleEntry(entry)
+        }
     }
     
     private func openChatGPT() {
@@ -445,6 +472,76 @@ struct SettingsView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
                         dismiss()
+                    }
+                }
+            }
+        }
+    }
+    
+    // MARK: - AI Analysis
+    
+    private func analyzeWithGemini() {
+        guard let entry = currentEntry else { return }
+        
+        isAnalyzing = true
+        aiAnalysisText = ""
+        showingAIAnalysis = true
+        
+        Task {
+            do {
+                let analysis = try await apiClient.analyzeJournal(
+                    entryId: entry.id.uuidString,
+                    analysisType: "general"
+                )
+                
+                await MainActor.run {
+                    aiAnalysisText = analysis.analysis
+                    isAnalyzing = false
+                }
+            } catch {
+                await MainActor.run {
+                    aiAnalysisText = "Failed to analyze: \(error.localizedDescription)\n\nMake sure the backend is running and properly configured with Google Gemini API key."
+                    isAnalyzing = false
+                }
+            }
+        }
+    }
+}
+
+// MARK: - AI Analysis View
+
+struct AIAnalysisView: View {
+    let analysisText: String
+    let isAnalyzing: Bool
+    let onDismiss: () -> Void
+    
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if isAnalyzing {
+                        VStack(spacing: 16) {
+                            ProgressView()
+                                .scaleEffect(1.2)
+                            Text("Analyzing your journal entry...")
+                                .font(.title3)
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        Text(analysisText)
+                            .font(.body)
+                            .lineSpacing(4)
+                            .padding()
+                    }
+                }
+            }
+            .navigationTitle("AI Analysis")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        onDismiss()
                     }
                 }
             }
